@@ -708,6 +708,7 @@ class EditorController(QObject):
     imageLoaded = pyqtSignal(str)
     undoRedoStatus = pyqtSignal(bool, bool)
     dirtyStateChanged = pyqtSignal(bool)
+    statusChanged = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -720,6 +721,7 @@ class EditorController(QObject):
         self.image_to_label: Dict[str, str] = {}
         self.current_idx: int = -1
         self.clipboard_item: Optional[AnnotationItem] = None
+        self.clipboard_annotations: List[AnnotationItem] = []
         self.last_error: str = ""
         self.current_pixmap: Optional[QPixmap] = None
         self.finished_images: Set[str] = set()
@@ -741,16 +743,19 @@ class EditorController(QObject):
 
     def load_verification_status(self) -> None:
         self.doubt_images.clear()
+        self.finished_images.clear()
         if self.project_json_path and os.path.exists(self.project_json_path):
             try:
                 with open(self.project_json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     doubt_list = data.get("doubt_images", data.get("verified_images", []))
                     self.doubt_images = set(doubt_list)
-                    print(f"[LOG] Loaded {len(self.doubt_images)} doubt images from {self.project_json_path}")
+                    finished_list = data.get("finished_images", [])
+                    self.finished_images = set(finished_list)
+                    print(f"[LOG] Loaded {len(self.doubt_images)} doubt images and {len(self.finished_images)} finished images from {self.project_json_path}")
                 self.sync_doubt_files_to_doubt_folders()
             except Exception as e:
-                print(f"[LOG] Error loading doubt status from {self.project_json_path}: {e}")
+                print(f"[LOG] Error loading verification status from {self.project_json_path}: {e}")
 
     def save_verification_status(self) -> None:
         if self.project_json_path:
@@ -758,14 +763,109 @@ class EditorController(QObject):
                 from datetime import datetime
                 data = {
                     "doubt_images": list(self.doubt_images),
+                    "finished_images": list(self.finished_images),
                     "total_doubt": len(self.doubt_images),
+                    "total_finished": len(self.finished_images),
                     "last_updated": datetime.now().isoformat()
                 }
                 with open(self.project_json_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
-                print(f"[LOG] Saved doubt status ({len(self.doubt_images)} doubt) to {self.project_json_path}")
+                print(f"[LOG] Saved verification status ({len(self.finished_images)} finished, {len(self.doubt_images)} doubt) to {self.project_json_path}")
             except Exception as e:
-                print(f"[LOG] Error saving doubt status to {self.project_json_path}: {e}")
+                print(f"[LOG] Error saving verification status to {self.project_json_path}: {e}")
+
+    def toggle_finished(self, image_path: Optional[str] = None) -> bool:
+        target = image_path or self.image_path
+        if not target:
+            return False
+        if target in self.finished_images:
+            self.finished_images.remove(target)
+            is_finished = False
+        else:
+            self.finished_images.add(target)
+            is_finished = True
+        self.save_verification_status()
+        self.statusChanged.emit()
+        return is_finished
+
+    def mark_finished(self, image_path: Optional[str] = None) -> bool:
+        target = image_path or self.image_path
+        if not target:
+            return False
+        self.finished_images.add(target)
+        self._saved_annotations_state = [item.to_dict() for item in self.annotations]
+        self.set_dirty(False)
+        self.save_verification_status()
+        self.statusChanged.emit()
+        return True
+
+    def mark_unfinished(self, image_path: Optional[str] = None) -> bool:
+        target = image_path or self.image_path
+        if not target:
+            return False
+        if target in self.finished_images:
+            self.finished_images.remove(target)
+            self.save_verification_status()
+            self.statusChanged.emit()
+            return True
+        return False
+
+    def load_annotations_for_image(self, target_img_path: str) -> List[AnnotationItem]:
+        if not target_img_path or target_img_path.startswith("sftp://"):
+            return []
+        lbl_path = self.image_to_label.get(target_img_path)
+        if not lbl_path:
+            base_no_ext = os.path.splitext(target_img_path)[0]
+            for ext in (".txt", ".xml", ".json", ".csv"):
+                p = base_no_ext + ext
+                if os.path.exists(p):
+                    lbl_path = p
+                    break
+            if not lbl_path:
+                lbl_path = base_no_ext + ".txt"
+
+        if lbl_path and os.path.exists(lbl_path) and os.path.getsize(lbl_path) > 0:
+            parser = ParserFactory.get_parser_for_file(lbl_path)
+            if parser:
+                w = self.image_width if self.image_width > 0 else 1280
+                h = self.image_height if self.image_height > 0 else 720
+                return parser.load(lbl_path, w, h)
+        return []
+
+    def copy_annotations_from_image(self, src_img_path: str, replace_existing: bool = True) -> int:
+        if not self.image_path or not src_img_path:
+            return 0
+        src_annos = self.load_annotations_for_image(src_img_path)
+        if not src_annos:
+            return 0
+
+        if replace_existing:
+            self.annotations.clear()
+
+        copied_count = 0
+        for item in src_annos:
+            cloned = item.clone()
+            self.annotations.append(cloned)
+            copied_count += 1
+
+        if copied_count > 0:
+            self.save_annotations()
+            self._on_annotations_changed()
+        return copied_count
+
+    def copy_annotations_from_prev_image(self) -> Tuple[int, str]:
+        if self.current_idx <= 0 or not self.image_list:
+            return 0, ""
+        prev_path = self.image_list[self.current_idx - 1]
+        count = self.copy_annotations_from_image(prev_path)
+        return count, os.path.basename(prev_path)
+
+    def copy_annotations_from_next_image(self) -> Tuple[int, str]:
+        if self.current_idx < 0 or self.current_idx >= len(self.image_list) - 1:
+            return 0, ""
+        next_path = self.image_list[self.current_idx + 1]
+        count = self.copy_annotations_from_image(next_path)
+        return count, os.path.basename(next_path)
 
     def _move_file_to_doubt(self, img_path: str) -> str:
         """
@@ -782,9 +882,10 @@ class EditorController(QObject):
             return img_path
 
         import shutil
-        doubt_img_dir = os.path.join(img_dir, "doubt")
-        os.makedirs(doubt_img_dir, exist_ok=True)
-        new_img_path = os.path.join(doubt_img_dir, img_name)
+        parent_dir = os.path.dirname(img_dir) if os.path.basename(img_dir).lower() in ("crops", "images") else img_dir
+        doubt_crop_dir = os.path.join(parent_dir, "crops", "doubt")
+        os.makedirs(doubt_crop_dir, exist_ok=True)
+        new_img_path = os.path.join(doubt_crop_dir, img_name)
 
         try:
             shutil.move(img_path, new_img_path)
@@ -971,7 +1072,13 @@ class EditorController(QObject):
 
     def _check_dirty(self) -> None:
         current_state = [item.to_dict() for item in self.annotations]
-        self.set_dirty(current_state != self._saved_annotations_state)
+        is_changed = (current_state != self._saved_annotations_state)
+        self.set_dirty(is_changed)
+        if is_changed and self.image_path and self.image_path in self.finished_images:
+            print(f"[LOG] Annotation modified on finished image {self.image_path} -> Auto-reverting to RED / Unfinished")
+            self.finished_images.remove(self.image_path)
+            self.save_verification_status()
+            self.statusChanged.emit()
 
     def _on_annotations_changed(self) -> None:
         self._check_dirty()
@@ -994,7 +1101,7 @@ class EditorController(QObject):
                     except OSError:
                         siblings = []
                     for sibling in siblings:
-                        if sibling.lower() == "labels":
+                        if sibling.lower() in ("labels", "lables", "label", "lable", "annotations"):
                             sibling_path = os.path.join(root, sibling)
                             if os.path.isdir(sibling_path):
                                 labels_dir = sibling_path
@@ -1037,11 +1144,6 @@ class EditorController(QObject):
 
         self.image_list = sorted(files, key=natural_sort_key)
         self.current_idx = -1
-        self.finished_images.clear()
-        for f in self.image_list:
-            lbl = self.image_to_label.get(f)
-            if lbl and os.path.exists(lbl) and os.path.getsize(lbl) > 0:
-                self.finished_images.add(f)
         self.project_json_path = os.path.join(folder_path, "project_verification.json")
         self.load_verification_status()
 
@@ -1291,33 +1393,52 @@ class EditorController(QObject):
                     
         # Fallback to loading standard matching image
         base_no_ext = os.path.splitext(file_path)[0]
+        base_filename = os.path.basename(base_no_ext)
+        parent_dir = os.path.dirname(file_path)
+        grandparent_dir = os.path.dirname(parent_dir)
+        
+        img_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
         possible_imgs = []
-        for img_ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"):
+
+        # 1. Direct path check with image extensions
+        for img_ext in img_extensions:
             possible_imgs.append(base_no_ext + img_ext)
-            
-            if "/labels/" in file_path.lower():
-                parts = file_path.rsplit("/labels/", 1)
-                for folder_name in ("crops", "images"):
-                    alt_path = parts[0] + f"/{folder_name}/" + os.path.splitext(parts[1])[0] + img_ext
-                    possible_imgs.append(alt_path)
-            if "\\labels\\" in file_path.lower():
-                parts = file_path.rsplit("\\labels\\", 1)
-                for folder_name in ("crops", "images"):
-                    alt_path = parts[0] + f"\\{folder_name}\\" + os.path.splitext(parts[1])[0] + img_ext
-                    possible_imgs.append(alt_path)
-                    
-        print(f"[DEBUG] Fallback possible_imgs: {possible_imgs}")
-        for possible_img in possible_imgs:
+
+        # 2. Check inside sibling folders of parent directory (e.g. grandparent/crops, grandparent/images, grandparent/full_images, grandparent)
+        for folder_name in ("crops", "images", "full_images", ""):
+            target_dir = os.path.join(grandparent_dir, folder_name) if folder_name else grandparent_dir
+            for img_ext in img_extensions:
+                possible_imgs.append(os.path.join(target_dir, base_filename + img_ext))
+
+        # 3. Path regex replacement for /labels/, /lables/, /label/, /lable/, /annotations/ -> /crops/, /images/, /full_images/
+        for pattern in [r'[/\\\\]la?be?ls?[/\\\\]', r'[/\\\\]annotations?[/\\\\]']:
+            for sub_folder in ("crops", "images", "full_images", ""):
+                sub_str = f'/{sub_folder}/' if sub_folder else '/'
+                new_path = re.sub(pattern, sub_str, file_path, flags=re.IGNORECASE)
+                for img_ext in img_extensions:
+                    possible_imgs.append(os.path.splitext(new_path)[0] + img_ext)
+
+        # Preserve order while removing duplicates
+        seen = set()
+        unique_possible_imgs = []
+        for img_p in possible_imgs:
+            if img_p not in seen:
+                seen.add(img_p)
+                unique_possible_imgs.append(img_p)
+
+        print(f"[DEBUG] Fallback unique_possible_imgs count: {len(unique_possible_imgs)}")
+        for possible_img in unique_possible_imgs:
             exists = os.path.exists(possible_img)
-            print(f"[DEBUG] Checking: {possible_img} -> Exists: {exists}")
             if exists:
+                print(f"[DEBUG] Found matching image: {possible_img}")
                 self.image_to_label[possible_img] = file_path
                 success = self.open_image(possible_img)
                 print(f"[DEBUG] Fallback open_image status: {success}")
                 if not success:
                     self.last_error = f"Found matching image, but failed to load it:\n{possible_img}"
                 return success
-        self.last_error = f"Could not find matching image for label file:\n{file_path}\nChecked paths:\n" + "\n".join(possible_imgs)
+
+        self.last_error = f"Could not find matching image for label file:\n{file_path}\nChecked paths:\n" + "\n".join(unique_possible_imgs[:15])
         print(f"[DEBUG] Fallback failed completely.")
         return False
 
@@ -1512,18 +1633,37 @@ class EditorController(QObject):
         self.history.push(AddItemCommand(self.annotations, dup_item, self._on_annotations_changed))
         return dup_item
 
-    def copy_annotation(self, item: AnnotationItem) -> None:
-        if item: self.clipboard_item = item.clone()
+    def copy_annotation(self, item: Optional[AnnotationItem] = None) -> int:
+        self.clipboard_annotations.clear()
+        if item:
+            self.clipboard_annotations.append(item.clone())
+            self.clipboard_item = item.clone()
+        elif self.annotations:
+            self.clipboard_annotations = [anno.clone() for anno in self.annotations]
+            self.clipboard_item = self.annotations[0].clone()
+        else:
+            self.clipboard_item = None
+        return len(self.clipboard_annotations)
 
-    def paste_annotation(self) -> Optional[AnnotationItem]:
-        if not self.clipboard_item: return None
-        offset = 20
-        new_x = min(self.clipboard_item.x + offset, self.image_width - self.clipboard_item.width)
-        new_y = min(self.clipboard_item.y + offset, self.image_height - self.clipboard_item.height)
-        p_item = AnnotationItem(self.clipboard_item.label, BoundingBox(new_x, new_y, self.clipboard_item.width, self.clipboard_item.height), self.clipboard_item.locked)
-        self.history.push(AddItemCommand(self.annotations, p_item, self._on_annotations_changed))
-        self.clipboard_item = p_item.clone()
-        return p_item
+    def paste_annotation(self, exact: bool = True) -> Optional[AnnotationItem]:
+        if not self.clipboard_annotations and self.clipboard_item:
+            self.clipboard_annotations = [self.clipboard_item.clone()]
+            
+        if not self.clipboard_annotations:
+            return None
+
+        self.annotations.clear()
+        for item in self.clipboard_annotations:
+            cloned = item.clone()
+            if not exact:
+                offset = 20
+                cloned.x = max(0, min(cloned.x + offset, self.image_width - cloned.width))
+                cloned.y = max(0, min(cloned.y + offset, self.image_height - cloned.height))
+            self.annotations.append(cloned)
+
+        self.save_annotations()
+        self._on_annotations_changed()
+        return self.annotations[0] if self.annotations else None
 
     def commit_geometry_change(self, item, old_box: BoundingBox) -> None:
         anno_item = item.annotation_item if hasattr(item, "annotation_item") else item
@@ -1910,6 +2050,27 @@ class ImageViewer(QGraphicsView):
         self._is_manually_zoomed = False
         self.fitInView(self.scene_obj.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self.zoomChanged.emit(self.transform().m11() * 100.0)
+
+    def fit_bbox(self, target_rect: QRectF, padding_factor: float = 0.35) -> None:
+        if not self._raw_pixmap or target_rect.isEmpty():
+            return
+        
+        w = target_rect.width()
+        h = target_rect.height()
+        pad_w = max(w * padding_factor, 15.0)
+        pad_h = max(h * padding_factor, 15.0)
+        
+        padded_rect = QRectF(
+            target_rect.x() - pad_w,
+            target_rect.y() - pad_h,
+            target_rect.width() + (2 * pad_w),
+            target_rect.height() + (2 * pad_h)
+        ).intersected(self.scene_obj.sceneRect())
+        
+        if padded_rect.width() > 0 and padded_rect.height() > 0:
+            self._is_manually_zoomed = True
+            self.fitInView(padded_rect, Qt.AspectRatioMode.KeepAspectRatio)
+            self.zoomChanged.emit(self.transform().m11() * 100.0)
 
     def reset_zoom(self) -> None:
         self._is_manually_zoomed = True
@@ -3068,7 +3229,7 @@ class MainWindow(QMainWindow):
         
         self.combo_filter = QComboBox()
         self.combo_filter.setFont(QFont("Outfit", 9))
-        self.combo_filter.addItems(["📁 All Images", "❓ Doubt Only", "✅ Clear / No Doubt"])
+        self.combo_filter.addItems(["📁 All Images", "🔴 Unfinished Only", "🟢 Finished Only", "❓ Doubt Only"])
         self.combo_filter.setStyleSheet("""
             QComboBox {
                 background-color: #1E1E24;
@@ -3090,25 +3251,39 @@ class MainWindow(QMainWindow):
         sidebar_layout.addLayout(filter_layout)
 
         self.file_list_widget = QListWidget()
-        self.file_list_widget.setFont(QFont("Outfit", 10))
+        self.file_list_widget.setFont(QFont("Outfit", 9))
+        self.file_list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: #121214;
+                border: 1px solid #2A2A2E;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-radius: 4px;
+                margin-bottom: 2px;
+            }
+            QListWidget::item:selected {
+                background-color: #00A2E8;
+                color: white;
+            }
+            QListWidget::item:hover:!selected {
+                background-color: #1E1E24;
+            }
+        """)
         self.file_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_list_widget.customContextMenuRequested.connect(self._show_file_list_context_menu)
-        self.file_list_widget.setStyleSheet("""
-            QListWidget { background-color: #121214; border: 1px solid #2A2A2E; border-radius: 4px; color: #A0A5B5; }
-            QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #1E1E24; }
-            QListWidget::item:selected { background-color: #00A2E8; color: white; border-radius: 2px; }
-            QListWidget::item:hover:!selected { background-color: #1E1E24; color: #E2E8F0; }
-        """)
         sidebar_layout.addWidget(self.file_list_widget)
 
         # Doubt status counter label
-        self.lbl_verification_counter = QLabel("Doubt: 0 / Total: 0")
+        self.lbl_verification_counter = QLabel("Finished: 0 / Total: 0")
         self.lbl_verification_counter.setFont(QFont("Outfit", 9, QFont.Weight.Bold))
         self.lbl_verification_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_verification_counter.setStyleSheet("""
             QLabel {
                 background-color: #18181C;
-                color: #FFB300;
+                color: #2ED573;
                 border: 1px solid #2A2A2E;
                 border-radius: 4px;
                 padding: 6px;
@@ -3231,7 +3406,7 @@ class MainWindow(QMainWindow):
         self.tool_group.addButton(self.btn_tool_create)
         self.tool_group.addButton(self.btn_tool_poly)
 
-        # Action Buttons (2x2 Grid)
+        # Action Buttons Grid
         actions_grid = QGridLayout()
         actions_grid.setSpacing(6)
 
@@ -3246,10 +3421,20 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("Save")
         self.btn_save.setStyleSheet(self._get_action_btn_stylesheet("#2ED573"))
         self.btn_save.clicked.connect(self._on_action_save)
+
+        self.btn_finish = QPushButton("✅ Finish (Shift+F)")
+        self.btn_finish.setToolTip("Mark image as Reviewed/Finished (GREEN status)")
+        self.btn_finish.setStyleSheet(self._get_action_btn_stylesheet("#2ED573"))
+        self.btn_finish.clicked.connect(self._on_action_finish)
         
         self.btn_fit = QPushButton("Fit Image")
         self.btn_fit.setStyleSheet(self._get_action_btn_stylesheet("#2F3542"))
         self.btn_fit.clicked.connect(self.viewer.fit_image)
+
+        self.btn_export_finished = QPushButton("📤 Export Finished")
+        self.btn_export_finished.setToolTip("Export ONLY labels of GREEN / Finished images")
+        self.btn_export_finished.setStyleSheet(self._get_action_btn_stylesheet("#00A2E8"))
+        self.btn_export_finished.clicked.connect(self._on_action_export_finished)
         
         self.btn_preview = QPushButton("🖼️ Annotation Preview")
         self.btn_preview.setToolTip("Full Image + Annotation Preview Popup (Ctrl+Shift+P)")
@@ -3260,15 +3445,38 @@ class MainWindow(QMainWindow):
         self.btn_delete_file.setStyleSheet(self._get_action_btn_stylesheet("#FF4757"))
         self.btn_delete_file.clicked.connect(lambda: self._on_action_delete_files_from_disk())
 
+        self.btn_copy_prev = QPushButton("📋 Copy Prev Bboxes (E)")
+        self.btn_copy_prev.setToolTip("Copy bounding boxes from previous image/frame (Shortcut: E or [)")
+        self.btn_copy_prev.setStyleSheet(self._get_action_btn_stylesheet("#3A3F51"))
+        self.btn_copy_prev.clicked.connect(self._on_action_copy_prev_bboxes)
+
+        self.btn_copy_next = QPushButton("📋 Copy Next Bboxes (N)")
+        self.btn_copy_next.setToolTip("Copy bounding boxes from next image/frame (Shortcut: N or ])")
+        self.btn_copy_next.setStyleSheet(self._get_action_btn_stylesheet("#3A3F51"))
+        self.btn_copy_next.clicked.connect(self._on_action_copy_next_bboxes)
+
+        self.btn_zoom_plate = QPushButton("🔍 Zoom to Plate (Z)")
+        self.btn_zoom_plate.setToolTip("Perfect zoom centered on license plate / bbox (Shortcut: Z)")
+        self.btn_zoom_plate.setStyleSheet(self._get_action_btn_stylesheet("#00A2E8"))
+        self.btn_zoom_plate.clicked.connect(self.zoom_to_license_plate)
+
         actions_grid.addWidget(self.btn_undo, 0, 0)
         actions_grid.addWidget(self.btn_redo, 0, 1)
         actions_grid.addWidget(self.btn_save, 1, 0)
-        actions_grid.addWidget(self.btn_fit, 1, 1)
-        actions_grid.addWidget(self.btn_preview, 2, 0, 1, 2)
-        actions_grid.addWidget(self.btn_delete_file, 3, 0, 1, 2)
+        actions_grid.addWidget(self.btn_finish, 1, 1)
+        actions_grid.addWidget(self.btn_copy_prev, 2, 0)
+        actions_grid.addWidget(self.btn_copy_next, 2, 1)
+        actions_grid.addWidget(self.btn_fit, 3, 0)
+        actions_grid.addWidget(self.btn_zoom_plate, 3, 1)
+        actions_grid.addWidget(self.btn_export_finished, 4, 0, 1, 2)
+        actions_grid.addWidget(self.btn_preview, 5, 0, 1, 2)
+        actions_grid.addWidget(self.btn_delete_file, 6, 0, 1, 2)
         tools_layout.addLayout(actions_grid)
 
-        # Always Fit Checkbox
+        # Fit & Zoom Mode Options
+        fit_options_layout = QHBoxLayout()
+        fit_options_layout.setSpacing(10)
+
         self.chk_always_fit = QCheckBox("Always Fit Image")
         self.chk_always_fit.setFont(QFont("Outfit", 9, QFont.Weight.Bold))
         self.chk_always_fit.setStyleSheet("color: #E2E8F0; margin-top: 4px;")
@@ -3279,7 +3487,21 @@ class MainWindow(QMainWindow):
             is_always_fit = bool(is_always_fit)
         self.chk_always_fit.setChecked(is_always_fit)
         self.chk_always_fit.toggled.connect(self._on_toggle_always_fit)
-        tools_layout.addWidget(self.chk_always_fit)
+
+        self.chk_always_zoom_plate = QCheckBox("Auto-Zoom to Plate")
+        self.chk_always_zoom_plate.setFont(QFont("Outfit", 9, QFont.Weight.Bold))
+        self.chk_always_zoom_plate.setStyleSheet("color: #00A2E8; margin-top: 4px;")
+        is_always_zoom = self.settings.value("alwaysZoomPlate", False)
+        if isinstance(is_always_zoom, str):
+            is_always_zoom = is_always_zoom.lower() == "true"
+        elif not isinstance(is_always_zoom, bool):
+            is_always_zoom = bool(is_always_zoom)
+        self.chk_always_zoom_plate.setChecked(is_always_zoom)
+        self.chk_always_zoom_plate.toggled.connect(self._on_toggle_always_zoom_plate)
+
+        fit_options_layout.addWidget(self.chk_always_fit)
+        fit_options_layout.addWidget(self.chk_always_zoom_plate)
+        tools_layout.addLayout(fit_options_layout)
 
         right_layout.addWidget(tools_group)
 
@@ -3397,6 +3619,20 @@ class MainWindow(QMainWindow):
         self.act_duplicate.setShortcut(QKeySequence("Ctrl+D"))
         self.act_duplicate.triggered.connect(self._on_action_duplicate)
         edit_menu.addAction(self.act_duplicate)
+
+        self.act_copy_prev_bboxes = QAction("📋 Copy Bboxes from &Previous Image", self)
+        self.act_copy_prev_bboxes.setShortcuts([QKeySequence("E"), QKeySequence("["), QKeySequence("Ctrl+Shift+C")])
+        self.act_copy_prev_bboxes.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.act_copy_prev_bboxes.triggered.connect(self._on_action_copy_prev_bboxes)
+        self.addAction(self.act_copy_prev_bboxes)
+        edit_menu.addAction(self.act_copy_prev_bboxes)
+
+        self.act_copy_next_bboxes = QAction("📋 Copy Bboxes from &Next Image", self)
+        self.act_copy_next_bboxes.setShortcuts([QKeySequence("N"), QKeySequence("]"), QKeySequence("Ctrl+Shift+V")])
+        self.act_copy_next_bboxes.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.act_copy_next_bboxes.triggered.connect(self._on_action_copy_next_bboxes)
+        self.addAction(self.act_copy_next_bboxes)
+        edit_menu.addAction(self.act_copy_next_bboxes)
 
         self.act_delete = QAction("&Delete Selected", self)
         self.act_delete.setShortcuts([QKeySequence("W"), QKeySequence("Delete"), QKeySequence("Backspace")])
@@ -3522,6 +3758,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.controller.imageLoaded.connect(self._on_controller_image_loaded)
         self.controller.stateChanged.connect(self._on_controller_state_changed)
+        self.controller.statusChanged.connect(self._on_controller_status_changed)
         self.controller.undoRedoStatus.connect(self._update_undo_redo_actions)
         self.controller.dirtyStateChanged.connect(self._on_dirty_state_changed)
 
@@ -3537,6 +3774,15 @@ class MainWindow(QMainWindow):
         self.file_list_widget.itemSelectionChanged.connect(self._on_sidebar_selection_changed)
         if hasattr(self, "lbl_crop") and self.lbl_crop:
             self.lbl_crop.clicked.connect(self._on_crop_preview_clicked)
+
+    def _on_controller_status_changed(self) -> None:
+        current_path = self.controller.image_path
+        if current_path and current_path in self.controller.image_list:
+            idx = self.controller.image_list.index(current_path)
+            item = self.file_list_widget.item(idx)
+            if item:
+                self._update_item_style(item, idx, current_path)
+        self._apply_file_filter()
 
     def _apply_theme(self) -> None:
         self.setFont(QFont("Outfit", 9))
@@ -3634,7 +3880,7 @@ class MainWindow(QMainWindow):
 
     def _update_item_style(self, item: QListWidgetItem, idx: int, f: str) -> None:
         is_doubt = f in self.controller.doubt_images
-        is_finished = f in self.controller.finished_images or idx <= 2830
+        is_finished = f in self.controller.finished_images
         base_name = os.path.basename(f)
         
         font = item.font()
@@ -3653,12 +3899,12 @@ class MainWindow(QMainWindow):
             item.setFont(font)
             item.setToolTip(f"🟢 Finished / Verified: {base_name}")
         else:
-            item.setText(f"📄  {idx + 1}. {base_name}")
-            item.setForeground(QColor("#A0A5B5"))  # Default soft gray for pending
-            item.setBackground(QBrush(QColor(0, 0, 0, 0)))
+            item.setText(f"🔴  {idx + 1}. {base_name}")
+            item.setForeground(QColor("#FF4D4D"))  # Vivid Red color for Unfinished / Pending Review
+            item.setBackground(QBrush(QColor(255, 77, 77, 20)))  # Subtle red background tint
             font.setBold(False)
             item.setFont(font)
-            item.setToolTip(f"Pending: {base_name}")
+            item.setToolTip(f"🔴 Unfinished / Pending Review: {base_name}")
 
     def _populate_file_list(self) -> None:
         self.file_list_widget.blockSignals(True)
@@ -3676,6 +3922,8 @@ class MainWindow(QMainWindow):
         filter_mode = self.combo_filter.currentIndex() if hasattr(self, "combo_filter") else 0
         total_count = len(self.controller.image_list)
         doubt_count = len(self.controller.doubt_images)
+        finished_count = len(self.controller.finished_images)
+        unfinished_count = total_count - finished_count
         visible_count = 0
 
         self.file_list_widget.blockSignals(True)
@@ -3683,28 +3931,150 @@ class MainWindow(QMainWindow):
             item = self.file_list_widget.item(i)
             f = item.data(Qt.ItemDataRole.UserRole)
             is_doubt = f in self.controller.doubt_images
+            is_finished = f in self.controller.finished_images
             
             show = True
-            if filter_mode == 1:  # Doubt Only
+            if filter_mode == 1:     # 🔴 Unfinished Only
+                show = not is_finished
+            elif filter_mode == 2:   # 🟢 Finished Only
+                show = is_finished
+            elif filter_mode == 3:   # ❓ Doubt Only
                 show = is_doubt
-            elif filter_mode == 2:  # Clear / No Doubt
-                show = not is_doubt
-                
+
             item.setHidden(not show)
             if show:
                 visible_count += 1
         self.file_list_widget.blockSignals(False)
 
-        pct = (doubt_count / total_count * 100.0) if total_count > 0 else 0.0
-        if filter_mode == 0:
-            txt = f"Doubt: {doubt_count} / Total: {total_count} ({pct:.0f}%)"
-        elif filter_mode == 1:
-            txt = f"Showing Doubt: {visible_count} of {total_count}"
-        else:
-            txt = f"Showing Clear: {visible_count} of {total_count}"
-            
+        pct = (finished_count / total_count * 100.0) if total_count > 0 else 0.0
+        txt = f"Finished: {finished_count} / {total_count} ({pct:.1f}%) | ❓ Doubt: {doubt_count}"
+
         if hasattr(self, "lbl_verification_counter"):
             self.lbl_verification_counter.setText(txt)
+
+    def _on_action_finish(self) -> None:
+        if not self.controller.image_path:
+            return
+        if self.controller.is_dirty:
+            self._on_action_save()
+
+        is_finished = self.controller.toggle_finished()
+        current_path = self.controller.image_path
+
+        if current_path in self.controller.image_list:
+            idx = self.controller.image_list.index(current_path)
+            item = self.file_list_widget.item(idx)
+            if item:
+                self._update_item_style(item, idx, current_path)
+
+        self._apply_file_filter()
+
+    def _on_action_export_finished(self) -> None:
+        if not self.controller.finished_images:
+            QMessageBox.information(
+                self, "Export Finished Labels",
+                "No images are currently marked as Finished (GREEN).\n\n"
+                "Please review and mark images as Finished first by clicking the Finish button or pressing Shift+F."
+            )
+            return
+
+        export_dir = QFileDialog.getExistingDirectory(
+            self, "Select Destination Folder for Exporting Finished Labels"
+        )
+        if not export_dir:
+            return
+
+        exported_count = 0
+        missing_count = 0
+
+        for img_path in list(self.controller.finished_images):
+            label_path = self.controller.image_to_label.get(img_path)
+            base_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
+
+            if not label_path or not os.path.exists(label_path):
+                alt_txt = os.path.splitext(img_path)[0] + ".txt"
+                if os.path.exists(alt_txt):
+                    label_path = alt_txt
+
+            if label_path and os.path.exists(label_path):
+                dest_file = os.path.join(export_dir, f"{base_name_no_ext}.txt")
+                try:
+                    import shutil
+                    shutil.copy2(label_path, dest_file)
+                    exported_count += 1
+                except Exception as e:
+                    print(f"[ERROR] Exporting label {label_path}: {e}")
+            else:
+                missing_count += 1
+
+        msg = f"Successfully exported {exported_count} finished label file(s) to:\n{export_dir}"
+        if missing_count > 0:
+            msg += f"\n\n({missing_count} finished image(s) did not have label files on disk)."
+
+        QMessageBox.information(self, "Export Complete", msg)
+
+    def _on_action_copy_prev_bboxes(self) -> None:
+        if self.controller.clipboard_annotations or self.controller.clipboard_item:
+            pasted = self.controller.paste_annotation(exact=True)
+            if pasted:
+                count = len(self.controller.annotations)
+                self.statusBar().showMessage(f"📋 Pasted {count} copied bbox & polygon coordinate(s) on current frame & saved", 4000)
+                if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                    self.zoom_to_license_plate()
+                if self.controller.image_path in self.controller.image_list:
+                    idx = self.controller.image_list.index(self.controller.image_path)
+                    item = self.file_list_widget.item(idx)
+                    if item:
+                        self._update_item_style(item, idx, self.controller.image_path)
+                return
+
+        count, prev_name = self.controller.copy_annotations_from_prev_image()
+        if count > 0:
+            self.statusBar().showMessage(f"📋 Copied {count} exact bbox(es) from previous frame ({prev_name}) & saved", 4000)
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                self.zoom_to_license_plate()
+            if self.controller.image_path in self.controller.image_list:
+                idx = self.controller.image_list.index(self.controller.image_path)
+                item = self.file_list_widget.item(idx)
+                if item:
+                    self._update_item_style(item, idx, self.controller.image_path)
+        else:
+            if self.controller.current_idx <= 0:
+                self.statusBar().showMessage("⚠️ No previous frame or copied clipboard bbox available", 3000)
+            else:
+                self.statusBar().showMessage(f"⚠️ No bboxes found in previous frame ({prev_name})", 3000)
+
+    def _on_action_copy_next_bboxes(self) -> None:
+        count, next_name = self.controller.copy_annotations_from_next_image()
+        if count > 0:
+            self.statusBar().showMessage(f"📋 Copied {count} exact bbox(es) from next frame ({next_name}) & saved", 4000)
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                self.zoom_to_license_plate()
+            if self.controller.image_path in self.controller.image_list:
+                idx = self.controller.image_list.index(self.controller.image_path)
+                item = self.file_list_widget.item(idx)
+                if item:
+                    self._update_item_style(item, idx, self.controller.image_path)
+        else:
+            if self.controller.current_idx >= len(self.controller.image_list) - 1:
+                self.statusBar().showMessage("⚠️ No next frame available", 3000)
+            else:
+                self.statusBar().showMessage(f"⚠️ No bboxes found in next frame ({next_name})", 3000)
+
+    def _copy_bboxes_from_specific_image(self, src_img_path: str) -> None:
+        count = self.controller.copy_annotations_from_image(src_img_path)
+        base_name = os.path.basename(src_img_path)
+        if count > 0:
+            self.statusBar().showMessage(f"📋 Copied {count} exact bbox(es) from {base_name} & saved", 4000)
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                self.zoom_to_license_plate()
+            if self.controller.image_path in self.controller.image_list:
+                idx = self.controller.image_list.index(self.controller.image_path)
+                item = self.file_list_widget.item(idx)
+                if item:
+                    self._update_item_style(item, idx, self.controller.image_path)
+        else:
+            self.statusBar().showMessage(f"⚠️ No bboxes found in {base_name}", 3000)
 
     def keyPressEvent(self, event) -> None:
         focused = QApplication.focusWidget()
@@ -3721,8 +4091,19 @@ class MainWindow(QMainWindow):
             self._on_action_prev()
             event.accept()
             return
+        elif key in (Qt.Key.Key_E, Qt.Key.Key_BracketLeft):
+            self._on_action_copy_prev_bboxes()
+            event.accept()
+            return
+        elif key in (Qt.Key.Key_N, Qt.Key.Key_BracketRight):
+            self._on_action_copy_next_bboxes()
+            event.accept()
+            return
         elif key == Qt.Key.Key_F:
-            self.viewer.fit_image()
+            if event.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier):
+                self._on_action_finish()
+            else:
+                self.viewer.fit_image()
             event.accept()
             return
         elif key == Qt.Key.Key_R:
@@ -3731,6 +4112,10 @@ class MainWindow(QMainWindow):
             return
         elif key == Qt.Key.Key_V:
             self._on_action_toggle_verify()
+            event.accept()
+            return
+        elif key == Qt.Key.Key_Z:
+            self.zoom_to_license_plate()
             event.accept()
             return
 
@@ -3745,6 +4130,7 @@ class MainWindow(QMainWindow):
             return
         
         is_doubt = image_path in self.controller.doubt_images
+        is_finished = image_path in self.controller.finished_images
         
         menu = QMenu(self)
         menu.setStyleSheet("""
@@ -3753,10 +4139,46 @@ class MainWindow(QMainWindow):
             QMenu::item:selected { background-color: #00A2E8; color: white; }
         """)
         
+        act_finish = QAction("🟢 Unmark Finished" if is_finished else "✅ Mark Finished", self)
+        act_finish.triggered.connect(lambda: self._toggle_item_finished(image_path))
+        menu.addAction(act_finish)
+
+        if image_path != self.controller.image_path:
+            act_copy_from = QAction("📋 Copy Bboxes from this Image to Current", self)
+            act_copy_from.triggered.connect(lambda: self._copy_bboxes_from_specific_image(image_path))
+            menu.addAction(act_copy_from)
+
         if is_doubt:
             act_toggle = QAction("❌ Remove Doubt Mark", self)
         else:
             act_toggle = QAction("❓ Mark as Doubt", self)
+        act_toggle.triggered.connect(lambda: self._toggle_item_doubt(image_path))
+        menu.addAction(act_toggle)
+
+        menu.addSeparator()
+        act_del = QAction("🗑️ Delete File from Disk", self)
+        act_del.triggered.connect(lambda: self._on_action_delete_files_from_disk(image_path))
+        menu.addAction(act_del)
+
+        menu.exec(self.file_list_widget.mapToGlobal(pos))
+
+    def _toggle_item_finished(self, image_path: str) -> None:
+        self.controller.toggle_finished(image_path)
+        if image_path in self.controller.image_list:
+            idx = self.controller.image_list.index(image_path)
+            item = self.file_list_widget.item(idx)
+            if item:
+                self._update_item_style(item, idx, image_path)
+        self._apply_file_filter()
+
+    def _toggle_item_doubt(self, image_path: str) -> None:
+        is_doubt, new_path = self.controller.toggle_doubt(image_path)
+        if new_path in self.controller.image_list:
+            idx = self.controller.image_list.index(new_path)
+            item = self.file_list_widget.item(idx)
+            if item:
+                self._update_item_style(item, idx, new_path)
+        self._apply_file_filter()
             
         act_toggle.triggered.connect(lambda: self._toggle_verification_for_path(image_path))
         menu.addAction(act_toggle)
@@ -3817,14 +4239,63 @@ class MainWindow(QMainWindow):
             self.file_list_widget.setCurrentRow(idx)
         self.file_list_widget.blockSignals(False)
 
+    def zoom_to_license_plate(self) -> None:
+        if not hasattr(self, "viewer") or not self.viewer:
+            return
+        
+        target_rect = None
+        selected_items = self.viewer.selected_items() if hasattr(self.viewer, "selected_items") else []
+        
+        if selected_items and hasattr(selected_items[0], "box"):
+            box = selected_items[0].box
+            target_rect = QRectF(box.x, box.y, box.width, box.height)
+        elif self.controller.annotations:
+            box = self.controller.annotations[0].box
+            target_rect = QRectF(box.x, box.y, box.width, box.height)
+            
+        if target_rect and not target_rect.isEmpty():
+            self.viewer.fit_bbox(target_rect)
+            self.statusBar().showMessage("🔍 Zoomed to License Plate / Bbox", 3000)
+        else:
+            self.viewer.fit_image()
+            self.statusBar().showMessage("Fit Full Image (No License Plate Bbox)", 3000)
+
+    def _on_toggle_always_zoom_plate(self, checked: bool) -> None:
+        self.settings.setValue("alwaysZoomPlate", checked)
+        if hasattr(self, "act_always_zoom_plate") and self.act_always_zoom_plate:
+            self.act_always_zoom_plate.blockSignals(True)
+            self.act_always_zoom_plate.setChecked(checked)
+            self.act_always_zoom_plate.blockSignals(False)
+        if checked:
+            if hasattr(self, "chk_always_fit") and self.chk_always_fit:
+                self.chk_always_fit.blockSignals(True)
+                self.chk_always_fit.setChecked(False)
+                self.chk_always_fit.blockSignals(False)
+                self.settings.setValue("alwaysFitImage", False)
+            if hasattr(self, "act_always_fit") and self.act_always_fit:
+                self.act_always_fit.blockSignals(True)
+                self.act_always_fit.setChecked(False)
+                self.act_always_fit.blockSignals(False)
+            self.zoom_to_license_plate()
+
     def _on_toggle_always_fit(self, checked: bool) -> None:
         self.settings.setValue("alwaysFitImage", checked)
         if hasattr(self, "act_always_fit") and self.act_always_fit:
             self.act_always_fit.blockSignals(True)
             self.act_always_fit.setChecked(checked)
             self.act_always_fit.blockSignals(False)
-        if checked and hasattr(self, "viewer") and self.viewer:
-            self.viewer.fit_image()
+        if checked:
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate:
+                self.chk_always_zoom_plate.blockSignals(True)
+                self.chk_always_zoom_plate.setChecked(False)
+                self.chk_always_zoom_plate.blockSignals(False)
+                self.settings.setValue("alwaysZoomPlate", False)
+            if hasattr(self, "act_always_zoom_plate") and self.act_always_zoom_plate:
+                self.act_always_zoom_plate.blockSignals(True)
+                self.act_always_zoom_plate.setChecked(False)
+                self.act_always_zoom_plate.blockSignals(False)
+            if hasattr(self, "viewer") and self.viewer:
+                self.viewer.fit_image()
 
     def _on_controller_image_loaded(self, path: str) -> None:
         self._add_to_recent_files(path)
@@ -3835,7 +4306,9 @@ class MainWindow(QMainWindow):
             pixmap = self.viewer.load_image(path)
         if pixmap:
             self._update_file_list_selection()
-            if hasattr(self, "chk_always_fit") and self.chk_always_fit and self.chk_always_fit.isChecked():
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                self.zoom_to_license_plate()
+            elif hasattr(self, "chk_always_fit") and self.chk_always_fit and self.chk_always_fit.isChecked():
                 self.viewer.fit_image()
             
             current_f = self.controller.image_list[self.controller.current_idx] if (0 <= self.controller.current_idx < len(self.controller.image_list)) else None
@@ -4227,17 +4700,19 @@ class MainWindow(QMainWindow):
 
     def _on_action_copy(self) -> None:
         sel = self.viewer.get_selected_item()
-        if sel:
-            self.controller.copy_annotation(sel.annotation_item)
-            self.status_bar.showMessage("Copied box.", 2000)
+        target_item = sel.annotation_item if sel else None
+        count = self.controller.copy_annotation(target_item)
+        if count > 0:
+            self.status_bar.showMessage(f"📋 Copied {count} bbox & polygon coordinate(s) (Press E on next frame to paste)", 3000)
+        else:
+            self.status_bar.showMessage("⚠️ No bboxes found to copy on current frame", 3000)
 
     def _on_action_paste(self) -> None:
-        pasted = self.controller.paste_annotation()
+        pasted = self.controller.paste_annotation(exact=True)
         if pasted:
-            for item in self.viewer.scene_obj.items():
-                if isinstance(item, BBoxGraphicItem) and item.annotation_item is pasted:
-                    self.viewer.select_item(item)
-                    break
+            if hasattr(self, "chk_always_zoom_plate") and self.chk_always_zoom_plate and self.chk_always_zoom_plate.isChecked():
+                self.zoom_to_license_plate()
+            self.status_bar.showMessage(f"📋 Pasted copied bbox coordinates ({pasted.label}) on current frame & saved", 3000)
 
     def _on_action_duplicate(self) -> None:
         sel = self.viewer.get_selected_item()
